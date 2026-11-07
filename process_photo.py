@@ -7,7 +7,7 @@ import os
 import tempfile
 import ctypes
 import time
-from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageFilter
+from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageFilter, ImageStat
 
 SIZE = 720
 FACE_LIBRARY = Path(__file__).resolve().parent / "build" / "libfacepython.so"
@@ -77,8 +77,8 @@ def choose_crop(image, faces):
                 margin = min(cx - left, left + side - cx, cy - top, top + side - cy)
                 score += weight * max(0, min(margin / side, 0.25))
             score -= 0.08 * abs(offset - max_offset / 2) / max(1, max_offset)
-            if best is None or score > best[0]:
-                best = (score, int(offset))
+            if best is None or (score, -abs(offset - max_offset / 2)) > best[0]:
+                best = ((score, -abs(offset - max_offset / 2)), int(offset))
         offset = best[1]
     else:
         # Pillow-only edge saliency: no NumPy/OpenCV dependency.
@@ -86,18 +86,39 @@ def choose_crop(image, faces):
         preview.thumbnail((384, 384))
         edges = preview.filter(ImageFilter.FIND_EDGES)
         ew, eh = edges.size
-        from PIL import ImageStat
-        best = None
+
+        scores = []
         for candidate in candidates:
             left, top = (candidate, 0) if w > h else (0, candidate)
-            rect = (round(left*ew/w), round(top*eh/h),
-                    max(round((left+side)*ew/w), round(left*ew/w)+1),
-                    max(round((top+side)*eh/h), round(top*eh/h)+1))
-            score = ImageStat.Stat(edges.crop(rect)).mean[0]
-            score -= 0.5 * abs(candidate - max_offset/2) / max(1, max_offset)
-            if best is None or score > best[0]:
-                best = (score, candidate)
-        offset = best[1]
+            rect = (
+                round(left * ew / w),
+                round(top * eh / h),
+                max(round((left + side) * ew / w),
+                    round(left * ew / w) + 1),
+                max(round((top + side) * eh / h),
+                    round(top * eh / h) + 1)
+            )
+            scores.append(ImageStat.Stat(edges.crop(rect)).sum[0])
+
+        # Normalize saliency across candidate crops.
+        low, high = min(scores), max(scores)
+        center = max_offset / 2
+        best_score = float('-inf')
+        offset = round(center)
+
+        for candidate, saliency in zip(candidates, scores):
+            normalized = ((saliency - low) / (high - low)
+                          if high > low else 0.0)
+
+            # 0 at center, 1 at either extreme.
+            distance = abs(candidate - center) / max(1, center)
+
+            # Saliency can shift the crop, but not without a benefit.
+            score = normalized - 0.65 * distance
+
+            if score > best_score:
+                best_score = score
+                offset = candidate
     return (offset, 0, offset + side, side) if w > h else (0, offset, side, offset + side)
 
 def load_font(font_path, size):
