@@ -5,39 +5,50 @@ from datetime import datetime
 from pathlib import Path
 import os
 import tempfile
-import numpy as np
+import ctypes
+import time
 from PIL import Image, ImageOps, ImageDraw, ImageFont, ImageFilter
 
 SIZE = 720
+FACE_LIBRARY = Path(__file__).resolve().parent / "build" / "libfacepython.so"
 
-def detect_faces(rgb, model):
-    if not model:
-        return []
-    try:
-        import cv2
-    except ImportError as exc:
-        raise RuntimeError('Face detection requires opencv-python') from exc
-    if not Path(model).is_file():
-        raise FileNotFoundError(f'Face model not found: {model}')
-    # YuNet's standard input size is 320x320. Detect at that size and
-    # transform face coordinates back into the original image space.
+def detect_faces(rgb, detector_size=320, min_confidence=0.85):
+    """Run native libfacedetection on a thumbnail, returning original-image boxes.
+
+    libfacepython.so must be alongside libfacedetection.so (or otherwise
+    discoverable by the Android dynamic linker).
+    """
     w, h = rgb.size
-    input_w = input_h = 320
-    arr = np.asarray(rgb.resize((input_w, input_h), Image.Resampling.BILINEAR))
-    detector = cv2.FaceDetectorYN.create(str(model), '', (input_w, input_h), score_threshold=0.9)
-    try:
-        _, faces = detector.detect(cv2.cvtColor(arr, cv2.COLOR_RGB2BGR))
-    except cv2.error as exc:
-        raise RuntimeError(
-            f'YuNet model incompatible with OpenCV {cv2.__version__}; '
-            'try the original 2022mar YuNet ONNX model or upgrade OpenCV. '
-            f'Model: {model}'
-        ) from exc
-    if faces is None:
-        return []
-    return [(float(x) * w / input_w, float(y) * h / input_h,
-             float(fw) * w / input_w, float(fh) * h / input_h, float(row[14]))
-            for row in faces for x, y, fw, fh in [row[:4]]]
+    scale = min(1.0, detector_size / max(w, h))
+    iw, ih = max(1, round(w * scale)), max(1, round(h * scale))
+    small = rgb.resize((iw, ih), Image.Resampling.BILINEAR)
+    # libfacedetection expects interleaved BGR, not Pillow's normal RGB.
+    pixels = small.tobytes("raw", "BGR")
+    data = (ctypes.c_ubyte * len(pixels)).from_buffer_copy(pixels)
+    native = ctypes.CDLL(str(FACE_LIBRARY))
+    fn = native.detect_faces_bgr
+    fn.argtypes = [ctypes.POINTER(ctypes.c_ubyte), ctypes.c_int, ctypes.c_int,
+                   ctypes.POINTER(ctypes.c_int), ctypes.c_int]
+    fn.restype = ctypes.c_int
+    max_faces = 100
+    results = (ctypes.c_int * (5 * max_faces))()
+    start = time.perf_counter()
+    count = fn(data, iw, ih, results, max_faces)
+    print(f'Native face detection: {time.perf_counter()-start:.3f}s ({iw}x{ih})')
+    if count < 0:
+        raise RuntimeError(f'Native detector failed: {count}')
+    faces = []
+    for i in range(count):
+        confidence, x, y, fw, fh = results[i*5:i*5+5]
+        confidence /= 100.0  # libfacedetection returns integer 0..100
+        print(
+            f"  raw face {i+1}: "
+            f"confidence={confidence:.3f}, "
+            f"x={x}, y={y}, w={fw}, h={fh}"
+        )
+        if confidence >= min_confidence and fw > 0 and fh > 0:
+            faces.append((x*w/iw, y*h/ih, fw*w/iw, fh*h/ih, confidence))
+    return faces
 
 def choose_crop(image, faces):
     w, h = image.size
@@ -47,7 +58,7 @@ def choose_crop(image, faces):
     # Score candidate square windows. Prioritize keeping all faces, then their centers.
     # Add a mild central bias for aesthetic composition.
     max_offset = max(w, h) - side
-    candidates = np.unique(np.linspace(0, max_offset, min(301, max_offset + 1)).astype(int))
+    candidates = sorted(set(round(i * max_offset / max(1, min(300, max_offset))) for i in range(min(300, max_offset) + 1)))
     if faces:
         best = None
         for offset in candidates:
@@ -70,19 +81,23 @@ def choose_crop(image, faces):
                 best = (score, int(offset))
         offset = best[1]
     else:
-        # Edge/detail saliency: prefer windows with visual information, but
-        # gently discourage extreme off-center crops.
-        gray = np.asarray(image.convert('L').resize((max(1, round(w * min(1, 512 / max(w,h)))), max(1, round(h * min(1, 512 / max(w,h)))))), dtype=np.float32)
-        gy, gx = np.gradient(gray)
-        detail = np.hypot(gx, gy)
-        scale_x = gray.shape[1] / w
-        scale_y = gray.shape[0] / h
-        scores = []
-        for offset in candidates:
-            l, t = (int(offset), 0) if w > h else (0, int(offset))
-            patch = detail[round(t * scale_y):max(round((t + side) * scale_y), round(t * scale_y)+1), round(l * scale_x):max(round((l + side) * scale_x), round(l * scale_x)+1)]
-            scores.append(float(patch.mean()) - 0.12 * float(detail.mean()) * abs(offset - max_offset / 2) / max(1, max_offset))
-        offset = int(candidates[int(np.argmax(scores))])
+        # Pillow-only edge saliency: no NumPy/OpenCV dependency.
+        preview = image.convert('L')
+        preview.thumbnail((384, 384))
+        edges = preview.filter(ImageFilter.FIND_EDGES)
+        ew, eh = edges.size
+        from PIL import ImageStat
+        best = None
+        for candidate in candidates:
+            left, top = (candidate, 0) if w > h else (0, candidate)
+            rect = (round(left*ew/w), round(top*eh/h),
+                    max(round((left+side)*ew/w), round(left*ew/w)+1),
+                    max(round((top+side)*eh/h), round(top*eh/h)+1))
+            score = ImageStat.Stat(edges.crop(rect)).mean[0]
+            score -= 0.5 * abs(candidate - max_offset/2) / max(1, max_offset)
+            if best is None or score > best[0]:
+                best = (score, candidate)
+        offset = best[1]
     return (offset, 0, offset + side, side) if w > h else (0, offset, side, offset + side)
 
 def load_font(font_path, size):
@@ -155,11 +170,11 @@ def write_debug(image, faces, crop, debug_path):
     canvas.save(debug_path, 'JPEG', quality=90)
 
 
-def process(src, dst, caption='', face_model=None, font=None, debug_path=None):
+def process(src, dst, caption='', detector_size=320, min_confidence=0.85, font=None, debug_path=None):
     with Image.open(src) as im:
         im = ImageOps.exif_transpose(im)
         rgb = im.convert('RGB')
-    faces = detect_faces(rgb, face_model)
+    faces = detect_faces(rgb, detector_size, min_confidence)
     crop = choose_crop(rgb, faces)
     if debug_path is not None:
         write_debug(rgb, faces, crop, debug_path)
@@ -212,7 +227,8 @@ def main():
     p.add_argument('input', type=Path, help='Source image')
     p.add_argument('--output-dir', type=Path, required=True, help='Required slideshow output directory')
     p.add_argument('--caption', default='')
-    p.add_argument('--face-model', type=Path, help='Path to local YuNet ONNX model')
+    p.add_argument('--detector-size', type=int, default=320, help='Maximum detection thumbnail dimension (default 320)')
+    p.add_argument('--min-confidence', type=float, default=0.85, help='Minimum native face confidence, 0..1 (default 0.85)')
     p.add_argument('--font', type=Path)
     p.add_argument('--debug', action='store_true', help='Save face boxes and crop outline in a separate debug folder')
     p.add_argument('--debug-dir', type=Path, help='Debug output directory (default: sibling of output-dir)')
@@ -223,7 +239,7 @@ def main():
         debug_dir = args.debug_dir or (args.output_dir.parent / (args.output_dir.name + '_debug'))
         debug_path = debug_dir / (dst.stem + '_debug.jpg')
     try:
-        crop, faces = process(args.input, dst, args.caption, args.face_model, args.font, debug_path)
+        crop, faces = process(args.input, dst, args.caption, args.detector_size, args.min_confidence, args.font, debug_path)
     except BaseException:
         dst.unlink(missing_ok=True)
         raise
